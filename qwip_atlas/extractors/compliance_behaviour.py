@@ -65,7 +65,7 @@ def _last_token_components(captured: dict[tuple[int, str], Any], layer: int, inf
     for name, tensor in tensors.items():
         if tensor is None:
             continue
-        out[name] = tensor[batch_idx, sl][-1].reshape(-1).numpy()
+        out[name] = tensor[batch_idx, sl][-1].reshape(-1).cpu().numpy()
     return out
 
 
