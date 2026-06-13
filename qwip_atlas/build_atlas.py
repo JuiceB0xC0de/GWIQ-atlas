@@ -636,9 +636,9 @@ def cmd_index(args):
                 "code_selective": summ.get("code_selective"),
             }
 
-    write_json(cross / "taxonomy_by_layer.json",         tax_by_layer)
-    write_json(cross / "fstat_top_by_layer.json",        fstat_by_layer)
-    write_json(cross / "code_entanglement_by_layer.json", code_by_layer)
+    write_json(cross / "taxonomy_by_layer.json",         {str(k): v for k, v in tax_by_layer.items()})
+    write_json(cross / "fstat_top_by_layer.json",        {str(k): v for k, v in fstat_by_layer.items()})
+    write_json(cross / "code_entanglement_by_layer.json", {str(k): v for k, v in code_by_layer.items()})
 
     print(f"[index] {len(layers_rows)} layers, {len(features_rows)} features, "
           f"{len(per_head_rows)} per-head rows, {len(subzero_sv_rows)} SVs, "
