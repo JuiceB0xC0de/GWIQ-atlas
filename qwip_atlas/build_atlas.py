@@ -31,6 +31,7 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
+import orjson
 
 from qwip_atlas.atlas_store import (
     DEFAULT_ATLAS_DIR, KNOWN_COMPONENTS, PER_HEAD_COMPONENTS,
@@ -62,14 +63,24 @@ def cmd_init(args):
         "head_dim":   args.head_dim,
     }
 
+    def _load_census_records(path: Path) -> list[dict]:
+        if path.suffix == ".npz":
+            z = np.load(path, allow_pickle=False)
+            meta = z.get("_metadata", None)
+            if meta is None:
+                raise SystemExit(f"no '_metadata' in {path}")
+            return orjson.loads(meta.tobytes())
+        return read_json(path)
+
     corpus_meta: dict = {}
     if args.census:
-        census = read_json(args.census)
+        census_path = Path(args.census)
+        census = _load_census_records(census_path)
         n_prompts = len(census)
         buckets   = Counter(r.get("bucket", "?") for r in census)
         corpus_meta = {
-            "source":    str(args.census),
-            "hash":      sha256_file(Path(args.census)),
+            "source":    str(census_path),
+            "hash":      sha256_file(census_path) if census_path.suffix != ".npz" else f"size:{census_path.stat().st_size}",
             "n_prompts": n_prompts,
             "buckets":   dict(buckets),
         }
@@ -121,19 +132,24 @@ def cmd_merge_layer(args):
     census_src = Path(args.census)
     if not census_src.exists():
         raise SystemExit(f"census file not found: {census_src}")
-    no_copy = getattr(args, "no_census_copy", False)
+    is_npz = census_src.suffix == ".npz"
+    no_copy = getattr(args, "no_census_copy", is_npz)   # default to no-copy for npz (multi-GB)
     L["census_raw"].parent.mkdir(parents=True, exist_ok=True)
     if not no_copy and census_src.resolve() != L["census_raw"].resolve():
         shutil.copy2(census_src, L["census_raw"])      # skipped under --no-census-copy (avoids ~250GB of dupes)
 
     try:
-        census = read_json(census_src)                 # orjson — fast even on a multi-GB census
+        if is_npz:
+            z = np.load(census_src, allow_pickle=False)
+            census = orjson.loads(z["_metadata"].tobytes())
+        else:
+            census = read_json(census_src)
         n_prompts = len(census)
     except Exception as e:
-        print(f"[warn] census JSON unreadable ({e.__class__.__name__}): skipping corpus metadata")
+        print(f"[warn] census unreadable ({e.__class__.__name__}): skipping corpus metadata")
         census = []
         n_prompts = None
-    # cheap provenance marker under --no-census-copy; full content hash otherwise (sha256 of 7GB is slow)
+    # cheap provenance marker under --no-census-copy (or for npz); full content hash otherwise
     corpus_hash = f"size:{census_src.stat().st_size}" if no_copy else sha256_file(census_src)
 
     layer_meta = {
@@ -658,6 +674,51 @@ def cmd_status(args):
 # CLI
 # ---------------------------------------------------------------------------
 
+def _max_layer_in_dir(census_dir: Path) -> int:
+    """Find highest N such that l<N>_census_raw.npz exists."""
+    best = -1
+    for p in census_dir.glob("l*_census_raw.npz"):
+        try:
+            n = int(p.stem.split("_")[0][1:])
+            best = max(best, n)
+        except ValueError:
+            continue
+    return best
+
+
+def cmd_merge_all_layers(args):
+    root = Path(args.atlas)
+    census_dir = Path(args.census_dir)
+    analysis_dir = Path(args.analysis_dir)
+
+    max_layer = args.max_layer
+    if max_layer is None:
+        max_layer = _max_layer_in_dir(census_dir)
+        if max_layer < 0:
+            raise SystemExit(f"no l<N>_census_raw.npz files found in {census_dir}")
+
+    for layer in range(args.min_layer, max_layer + 1):
+        census_npz = census_dir / f"l{layer}_census_raw.npz"
+        if not census_npz.exists():
+            print(f"[merge-all-layers] layer {layer}: census missing, skipping")
+            continue
+
+        if args.skip_existing and layer_paths(root, layer)["meta"].exists():
+            print(f"[merge-all-layers] layer {layer}: already merged, skipping")
+            continue
+
+        print(f"[merge-all-layers] merging layer {layer}")
+        # Build a fake args namespace for merge-layer
+        sub_args = argparse.Namespace(
+            atlas=str(root),
+            layer=layer,
+            census=str(census_npz),
+            analysis_dir=str(analysis_dir),
+            no_census_copy=True,
+        )
+        cmd_merge_layer(sub_args)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--atlas", default=str(DEFAULT_ATLAS_DIR))
@@ -672,20 +733,33 @@ def main():
     s.add_argument("--n-kv-heads", type=int, default=None)
     s.add_argument("--head-dim",   type=int, default=None)
     s.add_argument("--census", default=None,
-                   help="optional path to a census JSON to register corpus hash + buckets")
+                   help="optional path to a census JSON or .npz to register corpus hash + buckets")
     s.set_defaults(func=cmd_init)
 
     # merge-layer
     s = sub.add_parser("merge-layer")
     s.add_argument("--layer", type=int, required=True)
     s.add_argument("--census", required=True,
-                   help="path to l<N>_census_raw.json")
+                   help="path to l<N>_census_raw.json or .npz")
     s.add_argument("--analysis-dir", default=".",
                    help="dir containing analyzer outputs (l<N>_*_neuron_taxonomy.json etc.)")
     s.add_argument("--no-census-copy", action="store_true",
                    help="don't duplicate the multi-GB census into the atlas, and use a cheap "
                         "size marker instead of a full sha256 (keeps the atlas lean + merge fast)")
     s.set_defaults(func=cmd_merge_layer)
+
+    # merge-all-layers
+    s = sub.add_parser("merge-all-layers")
+    s.add_argument("--census-dir", required=True,
+                   help="directory containing l<N>_census_raw.npz files")
+    s.add_argument("--analysis-dir", required=True,
+                   help="directory containing analyzer outputs")
+    s.add_argument("--min-layer", type=int, default=0)
+    s.add_argument("--max-layer", type=int, default=None,
+                   help="if omitted, auto-detect from census files")
+    s.add_argument("--skip-existing", action="store_true",
+                   help="skip layers already present in the atlas")
+    s.set_defaults(func=cmd_merge_all_layers)
 
     # merge-subzero
     s = sub.add_parser("merge-subzero")
