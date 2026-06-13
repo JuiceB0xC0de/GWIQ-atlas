@@ -83,7 +83,58 @@ def load_census(path: str):
                   (only populated for is_per_head=True components)
       records:    list of metadata dicts
     Components missing from the file are silently skipped.
+
+    Fast path: .npz files already store arrays as [N, ...], so we transpose
+    directly without reconstructing per-record Python dicts.
     """
+    import orjson
+    from tqdm import tqdm
+
+    p = Path(path)
+
+    if p.suffix == ".npz":
+        print(f"[load] fast .npz path: {path}")
+        z = np.load(path, allow_pickle=False)
+        records = orjson.loads(z["_metadata"].tobytes())
+        if not records:
+            raise SystemExit(f"No census records found in {path}")
+
+        flat_mats: dict[str, np.ndarray] = {}
+        head_mats: dict[str, np.ndarray] = {}
+
+        for name, key, is_per_head, hint in tqdm(COMPONENTS, desc="load fields", unit="field"):
+            if key not in z.files:
+                tqdm.write(f"  [skip] component '{name}' (no '{key}' field)  {hint}")
+                continue
+
+            arr = z[key]
+            if arr.dtype == np.float16:
+                arr = arr.astype(np.float32)
+
+            if is_per_head:
+                # Stored as [N, H, Dh] or [N, seq, H, Dh] but last-token already collapsed.
+                # Our writer stores last/mean as [N, H, Dh] for per-head components.
+                if arr.ndim == 3:
+                    n_prompts, H, Dh = arr.shape
+                    head_mats[name] = arr.transpose(1, 2, 0)
+                    flat_mats[name] = arr.reshape(n_prompts, H * Dh).T
+                    tqdm.write(f"  [load] component '{name}': flat={flat_mats[name].shape}  "
+                               f"per-head={head_mats[name].shape}  {hint}")
+                else:
+                    tqdm.write(f"  [skip] component '{name}': unexpected ndim={arr.ndim}  {hint}")
+                    continue
+            else:
+                # Stored as [N, features].
+                if arr.ndim == 2:
+                    flat_mats[name] = arr.T
+                    tqdm.write(f"  [load] component '{name}': {flat_mats[name].shape}  {hint}")
+                else:
+                    tqdm.write(f"  [skip] component '{name}': unexpected ndim={arr.ndim}  {hint}")
+                    continue
+
+        return flat_mats, head_mats, records
+
+    # Legacy JSON path (slow, kept for old .json census files).
     records = read_census(path)
     if not records:
         raise SystemExit(
@@ -91,8 +142,8 @@ def load_census(path: str):
             "Please run a compatible census extractor and provide a valid JSON file."
         )
 
-    flat_mats: dict[str, np.ndarray] = {}
-    head_mats: dict[str, np.ndarray] = {}
+    flat_mats = {}
+    head_mats = {}
 
     for name, key, is_per_head, hint in COMPONENTS:
         if key not in records[0]:
@@ -100,7 +151,6 @@ def load_census(path: str):
             continue
 
         if is_per_head:
-            # Each record[key] is [H, Dh]; stack to [n_prompts, H, Dh]
             arr = np.array([r[key] for r in records], dtype=np.float32)  # [N, H, Dh]
             n_prompts, H, Dh = arr.shape
             head_mats[name] = arr.transpose(1, 2, 0)  # [H, Dh, n_prompts]
