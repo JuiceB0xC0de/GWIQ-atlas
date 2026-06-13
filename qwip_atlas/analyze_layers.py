@@ -752,6 +752,8 @@ def main():
                         help="Explicit code-like bucket name for the cross-reference "
                              "phase (e.g. 'core_technical', 'ml_ai'). If omitted, "
                              "auto-detection runs and prints the chosen bucket.")
+    parser.add_argument("--skip-existing", action="store_true",
+                        help="Skip components whose output files already exist.")
     args = parser.parse_args()
 
     if args.input is None:
@@ -811,6 +813,10 @@ def main():
     # Run collapsed analysis per component
     summaries = []
     for name, A in flat_mats.items():
+        done_marker = out / f"l{args.layer}_{name}_neuron_taxonomy.json"
+        if args.skip_existing and done_marker.exists():
+            print(f"  [skip-existing] l{args.layer} {name}")
+            continue
         summary = analyze_one(name, A, records, buckets, out, args.top_k,
                               layer=args.layer, code_bucket=code_bucket)
         summaries.append(summary)
@@ -827,6 +833,10 @@ def main():
         print("  PER-HEAD ANALYSIS  —  which heads carry the signal?")
         print("=" * 88)
         for name, A_3d in head_mats.items():
+            done_marker = out / f"l{args.layer}_{name}_per_head.json"
+            if args.skip_existing and done_marker.exists():
+                print(f"  [skip-existing] l{args.layer} {name} per-head")
+                continue
             per_head_results[name] = analyze_per_head(name, A_3d, buckets, out,
                                                      layer=args.layer,
                                                      code_bucket=code_bucket)
