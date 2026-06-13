@@ -15,10 +15,10 @@ def _load_model_and_tokenizer(cfg: ComplianceBehaviourRunConfig, hf_token: str |
     return _load(cfg, hf_token)  # type: ignore[arg-type]
 
 
-def _register_hooks(per_layer_info: dict[int, dict], captured: dict[tuple[int, str], Any]):
+def _register_hooks(per_layer_info: dict[int, dict], captured: dict[tuple[int, str], Any], components: set[str]):
     from qwip_atlas.extractors.local_census import _register_hooks
 
-    return _register_hooks(per_layer_info, captured)
+    return _register_hooks(per_layer_info, captured, components)
 
 
 def _load_prompts(corpus, label: str) -> list[dict[str, Any]]:
@@ -163,7 +163,7 @@ def run_compliance_behaviour(cfg: ComplianceBehaviourRunConfig, hf_token: str | 
         enc = {k: v.to(device) for k, v in enc.items()}
 
         captured: dict[tuple[int, str], Any] = {}
-        handles = _register_hooks(per_layer_info, captured)
+        handles = _register_hooks(per_layer_info, captured, cfg.components)
         with torch.no_grad():
             model(**enc, use_cache=False)
         for handle in handles:
