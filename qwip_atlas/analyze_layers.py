@@ -449,19 +449,16 @@ def compute_silhouette_scores(A: np.ndarray, buckets: list[str]) -> np.ndarray:
 
 
 def print_top_separators(scores: np.ndarray, n: int = 20,
-                         classifications: list[dict] = None):
+                         classifications: list[dict] = None,
+                         A: np.ndarray | None = None):
     top_idx = np.argsort(scores)[-n:][::-1]
     cls_map = {c["neuron_idx"]: c["class"] for c in (classifications or [])}
     print(f"\nTop {n} category-separating features (F-statistic):")
     print(f"  {'feature':>8}  {'F-stat':>10}  {'class':<30}  {'act_rate':>9}")
     for idx in top_idx:
         cls = cls_map.get(int(idx), "?")
-        act_rate = (A_global[idx] > ACTIVATION_THRESHOLD).mean() if A_global is not None else 0
+        act_rate = (A[idx] > ACTIVATION_THRESHOLD).mean() if A is not None else 0
         print(f"  {idx:>8}  {scores[idx]:>10.4f}  {cls:<30}  {act_rate:>9.3f}")
-
-
-# Module-level reference for print_top_separators helper
-A_global = None
 
 
 # ---------------------------------------------------------------------------
@@ -560,7 +557,6 @@ def analyze_per_head(name: str, A_3d: np.ndarray, buckets: list[str],
     code-preferring features (no heatmap, no co-activation — that would be
     H times the runtime). Saves a summary table and prints a per-head ranking.
     """
-    global A_global
     H, Dh, n_prompts = A_3d.shape
     print(f"\n  -- per-head breakdown for '{name}': {H} heads × {Dh}-dim each --")
 
@@ -574,7 +570,6 @@ def analyze_per_head(name: str, A_3d: np.ndarray, buckets: list[str],
 
     for h in range(H):
         A_h = A_3d[h]  # [Dh, n_prompts]
-        A_global = A_h
 
         # Lightweight: taxonomy + F-stat separation only
         classifications = classify_neurons(A_h, buckets)
@@ -633,9 +628,6 @@ def analyze_one(name: str, A: np.ndarray, records: list[dict],
                 layer: int,
                 code_bucket: str | None = None) -> dict:
     """Run the full 6-phase analysis on a single component matrix."""
-    global A_global
-    A_global = A
-
     prefix = f"l{layer}_{name}"
     print(f"\n{'='*70}\n  Layer {layer}  Component: {name}    matrix={A.shape}\n{'='*70}")
 
@@ -661,7 +653,7 @@ def analyze_one(name: str, A: np.ndarray, records: list[dict],
     print(f"\n--- {name}: Phase 5: Category separation scoring (F-statistic) ---")
     scores = compute_separation_scores(A, buckets)
     np.save(out / f"{prefix}_separation_scores.npy", scores)
-    print_top_separators(scores, n=20, classifications=classifications)
+    print_top_separators(scores, n=20, classifications=classifications, A=A)
 
     # Phase 6: Code cross-reference
     print(f"\n--- {name}: Phase 6: Code feature cross-reference ---")
