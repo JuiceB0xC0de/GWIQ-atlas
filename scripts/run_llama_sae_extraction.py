@@ -191,7 +191,6 @@ def _write_layer_npz(layer: int, variant: str, t_acc, t_n, b_acc, b_n, cats, N_t
 
 def run_variant(variant: str, batch_size: int = 16, max_length: int = 256):
     import torch
-    import numpy as np
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")

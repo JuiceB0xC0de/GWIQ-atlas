@@ -48,24 +48,37 @@ def _last_token_components(captured: dict[tuple[int, str], Any], layer: int, inf
     if mlp_hidden is None:
         return {}
 
-    gate_pre = captured.get((layer, "gate_pre"))
-    gate_post = act_fn(gate_pre) if gate_pre is not None else None
-    tensors = {
+    # Extract raw tensors to be sliced first
+    raw_tensors = {
         "mlp": mlp_hidden,
-        "gate": gate_post,
+        "gate": captured.get((layer, "gate_pre")),
         "up": captured.get((layer, "up")),
         "attn": captured.get((layer, "attn_out")),
-        "heads": _safe_per_head(captured.get((layer, "attn_pre")), head_dim),
-        "q": _safe_per_head(captured.get((layer, "q")), head_dim),
-        "k": _safe_per_head(captured.get((layer, "k")), head_dim),
-        "v": _safe_per_head(captured.get((layer, "v")), head_dim),
+        "heads": captured.get((layer, "attn_pre")),
+        "q": captured.get((layer, "q")),
+        "k": captured.get((layer, "k")),
+        "v": captured.get((layer, "v")),
     }
 
     out = {}
-    for name, tensor in tensors.items():
+    for name, tensor in raw_tensors.items():
         if tensor is None:
             continue
-        out[name] = tensor[batch_idx, sl][-1].reshape(-1).cpu().float().numpy()
+
+        # Optional validation for head dimensions that used to be in _safe_per_head
+        if name in {"heads", "q", "k", "v"}:
+            if not head_dim or tensor.shape[-1] % head_dim != 0:
+                continue
+
+        # Slice down to just the target token BEFORE applying expensive functions
+        sliced = tensor[batch_idx, sl][-1]
+
+        # Apply activation function ONLY on the final sliced tensor for 'gate'
+        if name == "gate":
+            sliced = act_fn(sliced)
+
+        out[name] = sliced.reshape(-1).cpu().float().numpy()
+
     return out
 
 
