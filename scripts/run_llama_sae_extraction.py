@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Run this inside a Modal GPU shell that has qwip-atlas + EleutherAI sae lib installed.
+Run this inside a Modal GPU shell that has qwip-atlas + sae-lens installed.
 
-Downloads corpora + SAE weights from HuggingFace inside the shell, encodes the
-Llama-3.1-8B MLP layers (0-31) for both 32x and 64x variants, and writes
+Uses OpenMOSS Llama-Scope SAEs (SAELens-compatible) for full MLP coverage on
+Llama-3.1-8B-Base. Variants "32x" / "64x" are kept as output labels but map to
+Llama-Scope's 8x (32K features) and 32x (128K features) MLP releases. Writes
 sae_l<N>_<variant>.npz to /gwiq-output/llama-3-8b/sae/.
 
 After this finishes:
@@ -19,9 +20,10 @@ from pathlib import Path
 
 MODEL_ID = "meta-llama/Llama-3.1-8B"
 CORPUS_REPO = "juiceb0xc0de/mapping-prompts"
-SAE_REPOS = {
-    "32x": "EleutherAI/sae-llama-3.1-8b-32x",
-    "64x": "EleutherAI/sae-llama-3.1-8b-64x",
+SAE_VARIANTS = {
+    # output_label: (SAELens release, sae_id suffix for layer L)
+    "32x": ("llama_scope_lxm_8x", "m_8x"),
+    "64x": ("llama_scope_lxm_32x", "m_32x"),
 }
 N_LAYERS = 32
 OUTPUT_DIR = Path("/gwiq-output/llama-3-8b/sae")
@@ -60,12 +62,12 @@ def _resolve_layers(model):
 def _load_saes(variant: str, device: str, dtype):
     from sae_lens import SAE
 
-    repo = SAE_REPOS[variant]
+    release, suffix = SAE_VARIANTS[variant]
     saes = {}
     for layer in range(N_LAYERS):
-        hookpoint = f"layers.{layer}.mlp"
-        print(f"[sae] loading {variant} {hookpoint} ...")
-        sae, _, _ = SAE.from_pretrained(release=repo, sae_id=hookpoint, device=device)
+        sae_id = f"l{layer}{suffix}"
+        print(f"[sae] loading {variant} {sae_id} (release={release}) ...")
+        sae, _, _ = SAE.from_pretrained(release=release, sae_id=sae_id, device=device)
         saes[layer] = sae.to(dtype=dtype)
     return saes
 
