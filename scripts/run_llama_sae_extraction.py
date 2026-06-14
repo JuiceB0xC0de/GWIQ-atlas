@@ -7,6 +7,10 @@ Llama-3.1-8B-Base. Variants "32x" / "64x" are kept as output labels but map to
 Llama-Scope's 8x (32K features) and 32x (128K features) MLP releases. Writes
 sae_l<N>_<variant>.npz to /gwiq-output/llama-3-8b/sae/.
 
+Memory-safe: processes layers in chunks of CHUNK_SIZE (default 10), loading only
+that chunk of SAEs at a time while keeping the model loaded. This balances GPU
+memory against the cost of repeated corpus passes.
+
 After this finishes:
     qwip-build-atlas --atlas /gwiq-output/atlas index
     python -m qwip_atlas.merge_sae --variant 32x --atlas /gwiq-output/atlas --sae-dir /gwiq-output/llama-3-8b/sae
@@ -26,6 +30,7 @@ SAE_VARIANTS = {
     "64x": ("llama_scope_lxm_32x", "m_32x"),
 }
 N_LAYERS = 32
+CHUNK_SIZE = 10
 OUTPUT_DIR = Path("/gwiq-output/llama-3-8b/sae")
 
 
@@ -59,39 +64,45 @@ def _resolve_layers(model):
     raise RuntimeError("Cannot find layers ModuleList")
 
 
-def _load_saes(variant: str, device: str, dtype):
+def _load_sae(variant: str, layer: int, device: str, dtype):
     from sae_lens import SAE
 
     release, suffix = SAE_VARIANTS[variant]
-    saes = {}
-    for layer in range(N_LAYERS):
-        sae_id = f"l{layer}{suffix}"
-        print(f"[sae] loading {variant} {sae_id} (release={release}) ...")
-        sae, _, _ = SAE.from_pretrained(release=release, sae_id=sae_id, device=device)
-        saes[layer] = sae.to(dtype=dtype)
-    return saes
+    sae_id = f"l{layer}{suffix}"
+    print(f"[sae] loading {variant} {sae_id} (release={release}) ...")
+    result = SAE.from_pretrained(release=release, sae_id=sae_id, device=device)
+    # Newer sae-lens returns only the SAE; older versions returned a tuple.
+    sae = result[0] if isinstance(result, tuple) else result
+    return sae.to(dtype=dtype)
 
 
-def _encode_pass(model, tokenizer, saes, corpus, group_fn, n_groups, batch_size, max_length, device):
+def _encode_chunk_pass(model, tokenizer, saes: dict, corpus, group_fn, n_groups, batch_size, max_length, device, desc: str):
     import torch
     from tqdm import tqdm
 
     target_layers = sorted(saes.keys())
-    first_sae = next(iter(saes.values()))
-    d_sae = first_sae.cfg.d_sae
 
+    # Per-layer accumulators keyed by layer index.
     acc = {
         L: {
-            "sum": torch.zeros(n_groups, d_sae, dtype=torch.float64, device=device),
-            "sumsq": torch.zeros(n_groups, d_sae, dtype=torch.float64, device=device),
-            "active": torch.zeros(d_sae, dtype=torch.float64, device=device),
+            "sum": torch.zeros(n_groups, saes[L].cfg.d_sae, dtype=torch.float64, device=device),
+            "sumsq": torch.zeros(n_groups, saes[L].cfg.d_sae, dtype=torch.float64, device=device),
+            "active": torch.zeros(saes[L].cfg.d_sae, dtype=torch.float64, device=device),
         }
         for L in target_layers
     }
     group_n = torch.zeros(n_groups, dtype=torch.float64, device=device)
 
+    layers = _resolve_layers(model)
+    captured: dict[int, torch.Tensor] = {}
+
+    def make_hook(target_layer: int):
+        def _hook(mod, inp, out):
+            captured[target_layer] = (out[0] if isinstance(out, tuple) else out).detach()
+        return _hook
+
     n_batches = (len(corpus) + batch_size - 1) // batch_size
-    for bstart in tqdm(range(0, len(corpus), batch_size), total=n_batches, desc="batches"):
+    for bstart in tqdm(range(0, len(corpus), batch_size), total=n_batches, desc=desc):
         batch = corpus[bstart : bstart + batch_size]
         prompts = [r["prompt"] for r in batch]
         groups = [group_fn(r) for r in batch]
@@ -100,19 +111,10 @@ def _encode_pass(model, tokenizer, saes, corpus, group_fn, n_groups, batch_size,
         mask = enc["attention_mask"].bool()
         enc = {k: v.to(device) for k, v in enc.items()}
 
-        captured: dict[int, torch.Tensor] = {}
-
-        def make_hook(layer: int):
-            def _hook(mod, inp, out):
-                captured[layer] = (out[0] if isinstance(out, tuple) else out).detach()
-            return _hook
-
-        layers = _resolve_layers(model)
+        captured.clear()
         handles = [layers[L].mlp.register_forward_hook(make_hook(L)) for L in target_layers]
-
         with torch.no_grad():
             model(**enc, use_cache=False)
-
         for h in handles:
             h.remove()
 
@@ -142,15 +144,13 @@ def _encode_pass(model, tokenizer, saes, corpus, group_fn, n_groups, batch_size,
                 if L == target_layers[0]:
                     group_n[gid] += tokens.shape[0]
 
-        captured.clear()
-
     return acc, group_n
 
 
-def _fstat_from_sums(acc_L, group_n):
+def _fstat_from_sums(acc, group_n):
     import torch
 
-    s, ss = acc_L["sum"], acc_L["sumsq"]
+    s, ss = acc["sum"], acc["sumsq"]
     n = group_n.unsqueeze(1).clamp_min(1)
     G = s.shape[0]
     N = group_n.sum().clamp_min(1)
@@ -161,6 +161,32 @@ def _fstat_from_sums(acc_L, group_n):
     df_b, df_w = max(G - 1, 1), torch.clamp(N - G, min=1)
     F = (ssb / df_b) / (ssw / df_w + 1e-12)
     return F.float().cpu().numpy()
+
+
+def _write_layer_npz(layer: int, variant: str, t_acc, t_n, b_acc, b_n, cats, N_topic: float):
+    import numpy as np
+
+    topic_fstat = _fstat_from_sums(t_acc, t_n)
+    activation_rate = (t_acc["active"] / max(N_topic, 1)).float().cpu().numpy()
+    bouncer_fstat = _fstat_from_sums(b_acc, b_n)
+
+    s, n = b_acc["sum"], b_n.clamp_min(1).unsqueeze(1)
+    mean = (s / n).float().cpu().numpy()
+    mean_corp, mean_auth = mean[0], mean[1]
+    bouncer_delta = mean_corp - mean_auth
+
+    out_path = OUTPUT_DIR / f"sae_l{layer}_{variant}.npz"
+    np.savez_compressed(
+        out_path,
+        categories=np.array(cats),
+        topic_fstat=topic_fstat.astype(np.float32),
+        activation_rate=activation_rate.astype(np.float32),
+        bouncer_fstat=bouncer_fstat.astype(np.float32),
+        bouncer_delta=bouncer_delta.astype(np.float32),
+        mean_corp=mean_corp.astype(np.float32),
+        mean_auth=mean_auth.astype(np.float32),
+    )
+    print(f"[sae] wrote {out_path}")
 
 
 def run_variant(variant: str, batch_size: int = 16, max_length: int = 256):
@@ -178,62 +204,53 @@ def run_variant(variant: str, batch_size: int = 16, max_length: int = 256):
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=dtype, device_map=device, token=token)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=dtype, device_map=device, token=token)
     model.eval()
 
-    saes = _load_saes(variant, device, dtype)
-    first_sae = next(iter(saes.values()))
-    d_sae = first_sae.cfg.d_sae
-
-    # Topic pass
     topic = _load_jsonl_from_hf(CORPUS_REPO, "prompts.jsonl", "prompt", token)
     cats = sorted({r["category"] for r in topic})
     cat_id = {c: i for i, c in enumerate(cats)}
     print(f"[sae] topic: {len(topic)} prompts, {len(cats)} categories")
 
-    t_acc, t_n = _encode_pass(
-        model, tokenizer, saes, topic,
-        lambda r: cat_id[r["category"]], len(cats),
-        batch_size, max_length, device,
-    )
-
-    # Compliance pass
     corp = _load_jsonl_from_hf(CORPUS_REPO, "corporate_stems.jsonl", "text", token)
     auth = _load_jsonl_from_hf(CORPUS_REPO, "authentic_bella_samples.jsonl", "text", token)
     bcorpus = [{"prompt": r["prompt"], "_g": 0} for r in corp] + [{"prompt": r["prompt"], "_g": 1} for r in auth]
     print(f"[sae] compliance: {len(corp)} corp + {len(auth)} auth")
 
-    b_acc, b_n = _encode_pass(
-        model, tokenizer, saes, bcorpus,
-        lambda r: r["_g"], 2,
-        batch_size, max_length, device,
-    )
-
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    N_topic = float(t_n.sum().item())
+    d_sae = None
 
-    for L in sorted(saes.keys()):
-        topic_fstat = _fstat_from_sums(t_acc[L], t_n)
-        activation_rate = (t_acc[L]["active"] / max(N_topic, 1)).float().cpu().numpy()
-        bouncer_fstat = _fstat_from_sums(b_acc[L], b_n)
+    for chunk_start in range(0, N_LAYERS, CHUNK_SIZE):
+        chunk_layers = list(range(chunk_start, min(chunk_start + CHUNK_SIZE, N_LAYERS)))
+        print(f"\n[sae] === chunk layers {chunk_layers[0]}-{chunk_layers[-1]} ===")
 
-        s, n = b_acc[L]["sum"], b_n.clamp_min(1).unsqueeze(1)
-        mean = (s / n).float().cpu().numpy()
-        mean_corp, mean_auth = mean[0], mean[1]
-        bouncer_delta = mean_corp - mean_auth
+        saes = {L: _load_sae(variant, L, device, dtype) for L in chunk_layers}
+        if d_sae is None:
+            d_sae = next(iter(saes.values())).cfg.d_sae
 
-        out_path = OUTPUT_DIR / f"sae_l{L}_{variant}.npz"
-        np.savez_compressed(
-            out_path,
-            categories=np.array(cats),
-            topic_fstat=topic_fstat.astype(np.float32),
-            activation_rate=activation_rate.astype(np.float32),
-            bouncer_fstat=bouncer_fstat.astype(np.float32),
-            bouncer_delta=bouncer_delta.astype(np.float32),
-            mean_corp=mean_corp.astype(np.float32),
-            mean_auth=mean_auth.astype(np.float32),
+        t_acc_chunk, t_n = _encode_chunk_pass(
+            model, tokenizer, saes, topic,
+            lambda r: cat_id[r["category"]], len(cats),
+            batch_size, max_length, device,
+            desc=f"topic L{chunk_layers[0]}-{chunk_layers[-1]}",
         )
-        print(f"[sae] wrote {out_path}")
+
+        b_acc_chunk, b_n = _encode_chunk_pass(
+            model, tokenizer, saes, bcorpus,
+            lambda r: r["_g"], 2,
+            batch_size, max_length, device,
+            desc=f"comp L{chunk_layers[0]}-{chunk_layers[-1]}",
+        )
+
+        N_topic = float(t_n.sum().item())
+        for L in chunk_layers:
+            _write_layer_npz(L, variant, t_acc_chunk[L], t_n, b_acc_chunk[L], b_n, cats, N_topic)
+
+        del saes, t_acc_chunk, b_acc_chunk
+        torch.cuda.empty_cache()
+
+    del model
+    torch.cuda.empty_cache()
 
     return {"variant": variant, "layers": N_LAYERS, "features": d_sae}
 
