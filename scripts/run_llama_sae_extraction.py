@@ -58,15 +58,15 @@ def _resolve_layers(model):
 
 
 def _load_saes(variant: str, device: str, dtype):
-    from sae import Sae
+    from sae_lens import SAE
 
     repo = SAE_REPOS[variant]
     saes = {}
     for layer in range(N_LAYERS):
         hookpoint = f"layers.{layer}.mlp"
         print(f"[sae] loading {variant} {hookpoint} ...")
-        sae = Sae.load_from_hub(repo, hookpoint=hookpoint)
-        saes[layer] = sae.to(device=device, dtype=dtype)
+        sae, _, _ = SAE.from_pretrained(release=repo, sae_id=hookpoint, device=device)
+        saes[layer] = sae.to(dtype=dtype)
     return saes
 
 
@@ -76,7 +76,7 @@ def _encode_pass(model, tokenizer, saes, corpus, group_fn, n_groups, batch_size,
 
     target_layers = sorted(saes.keys())
     first_sae = next(iter(saes.values()))
-    d_sae = first_sae.w_enc.shape[1]
+    d_sae = first_sae.cfg.d_sae
 
     acc = {
         L: {
@@ -127,13 +127,10 @@ def _encode_pass(model, tokenizer, saes, corpus, group_fn, n_groups, batch_size,
                 if tokens.numel() == 0:
                     continue
 
-                acts = sae.encode(tokens.to(sae.dtype))
-                if hasattr(acts, "values") and hasattr(acts, "indices"):
-                    vals = acts.values.clamp_min(0).double()
-                    inds = acts.indices
-                else:
-                    vals, inds = acts.topk(sae.k, dim=-1)
-                    vals = vals.clamp_min(0).double()
+                acts = sae.encode(tokens)
+                k = getattr(sae.cfg, "k", None) or acts.shape[-1]
+                vals, inds = acts.topk(k, dim=-1)
+                vals = vals.clamp_min(0).double()
 
                 flat_i = inds.reshape(-1)
                 flat_v = vals.reshape(-1)
@@ -184,7 +181,7 @@ def run_variant(variant: str, batch_size: int = 16, max_length: int = 256):
 
     saes = _load_saes(variant, device, dtype)
     first_sae = next(iter(saes.values()))
-    d_sae = first_sae.w_enc.shape[1]
+    d_sae = first_sae.cfg.d_sae
 
     # Topic pass
     topic = _load_jsonl_from_hf(CORPUS_REPO, "prompts.jsonl", "prompt", token)
