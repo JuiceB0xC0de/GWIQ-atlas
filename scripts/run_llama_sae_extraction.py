@@ -7,9 +7,9 @@ Llama-3.1-8B-Base. Variants "32x" / "64x" are kept as output labels but map to
 Llama-Scope's 8x (32K features) and 32x (128K features) MLP releases. Writes
 sae_l<N>_<variant>.npz to /gwiq-output/llama-3-8b/sae/.
 
-Memory-safe: processes layers in chunks of CHUNK_SIZE (default 10), loading only
-that chunk of SAEs at a time while keeping the model loaded. This balances GPU
-memory against the cost of repeated corpus passes.
+Memory strategy: model loaded once. For each batch we capture MLP outputs for
+the target chunk on GPU, move them to CPU, then load SAEs one at a time to
+encode. This keeps peak GPU memory near model + 1 SAE + one batch activations.
 
 After this finishes:
     qwip-build-atlas --atlas /gwiq-output/atlas index
@@ -30,7 +30,7 @@ SAE_VARIANTS = {
     "64x": ("llama_scope_lxm_32x", "m_32x"),
 }
 N_LAYERS = 32
-CHUNK_SIZE = 10
+CHUNK_SIZE = 5
 OUTPUT_DIR = Path("/gwiq-output/llama-3-8b/sae")
 
 
@@ -76,22 +76,21 @@ def _load_sae(variant: str, layer: int, device: str, dtype):
     return sae.to(dtype=dtype)
 
 
-def _encode_chunk_pass(model, tokenizer, saes: dict, corpus, group_fn, n_groups, batch_size, max_length, device, desc: str):
+def _encode_chunk_pass(model, tokenizer, variant: str, chunk_layers: list, corpus, group_fn, n_groups,
+                       batch_size, max_length, device, dtype, desc: str):
     import torch
     from tqdm import tqdm
 
-    target_layers = sorted(saes.keys())
-
-    # Per-layer accumulators keyed by layer index.
+    # Per-layer CPU-side accumulators.
     acc = {
         L: {
-            "sum": torch.zeros(n_groups, saes[L].cfg.d_sae, dtype=torch.float64, device=device),
-            "sumsq": torch.zeros(n_groups, saes[L].cfg.d_sae, dtype=torch.float64, device=device),
-            "active": torch.zeros(saes[L].cfg.d_sae, dtype=torch.float64, device=device),
+            "sum": None,
+            "sumsq": None,
+            "active": None,
         }
-        for L in target_layers
+        for L in chunk_layers
     }
-    group_n = torch.zeros(n_groups, dtype=torch.float64, device=device)
+    group_n = None
 
     layers = _resolve_layers(model)
     captured: dict[int, torch.Tensor] = {}
@@ -112,37 +111,62 @@ def _encode_chunk_pass(model, tokenizer, saes: dict, corpus, group_fn, n_groups,
         enc = {k: v.to(device) for k, v in enc.items()}
 
         captured.clear()
-        handles = [layers[L].mlp.register_forward_hook(make_hook(L)) for L in target_layers]
+        handles = [layers[L].mlp.register_forward_hook(make_hook(L)) for L in chunk_layers]
         with torch.no_grad():
             model(**enc, use_cache=False)
         for h in handles:
             h.remove()
 
-        for L in target_layers:
-            mlp_out = captured[L]
-            sae = saes[L]
+        # Move small metadata to CPU; move MLP outputs to CPU to free GPU before SAE encode.
+        mask_cpu = mask.cpu()
+        mlp_cpu = {L: captured[L].float().cpu() for L in chunk_layers}
+
+        # Accumulate token counts once.
+        if group_n is None:
+            group_n = torch.zeros(n_groups, dtype=torch.float64)
+        for gid in set(groups):
+            idx = [i for i, g in enumerate(groups) if g == gid]
+            if not idx:
+                continue
+            sub_mask = mask_cpu[idx]
+            group_n[gid] += sub_mask.sum().item()
+
+        # Encode each layer with its own SAE, one at a time, to keep GPU memory low.
+        for L in chunk_layers:
+            sae = _load_sae(variant, L, device, dtype)
+            d_sae = sae.cfg.d_sae
+
+            if acc[L]["sum"] is None:
+                acc[L]["sum"] = torch.zeros(n_groups, d_sae, dtype=torch.float64)
+                acc[L]["sumsq"] = torch.zeros(n_groups, d_sae, dtype=torch.float64)
+                acc[L]["active"] = torch.zeros(d_sae, dtype=torch.float64)
+
             for gid in set(groups):
                 idx = [i for i, g in enumerate(groups) if g == gid]
                 if not idx:
                     continue
-                sub = mlp_out[idx]
-                sub_mask = mask[idx]
+                sub = mlp_cpu[L][idx]
+                sub_mask = mask_cpu[idx]
                 tokens = sub[sub_mask]
                 if tokens.numel() == 0:
                     continue
 
-                acts = sae.encode(tokens)
+                acts = sae.encode(tokens.to(device))
                 k = getattr(sae.cfg, "k", None) or acts.shape[-1]
                 vals, inds = acts.topk(k, dim=-1)
-                vals = vals.clamp_min(0).double()
-
+                vals = vals.clamp_min(0).double().cpu()
+                inds = inds.cpu()
                 flat_i = inds.reshape(-1)
                 flat_v = vals.reshape(-1)
                 acc[L]["sum"][gid].index_add_(0, flat_i, flat_v)
                 acc[L]["sumsq"][gid].index_add_(0, flat_i, flat_v * flat_v)
                 acc[L]["active"].index_add_(0, flat_i, torch.ones_like(flat_v))
-                if L == target_layers[0]:
-                    group_n[gid] += tokens.shape[0]
+
+            del sae, acts, vals, inds, tokens
+            torch.cuda.empty_cache()
+
+        del mlp_cpu, mask_cpu
+        captured.clear()
 
     return acc, group_n
 
@@ -191,7 +215,6 @@ def _write_layer_npz(layer: int, variant: str, t_acc, t_n, b_acc, b_n, cats, N_t
 
 def run_variant(variant: str, batch_size: int = 16, max_length: int = 256):
     import torch
-    import numpy as np
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
@@ -224,29 +247,28 @@ def run_variant(variant: str, batch_size: int = 16, max_length: int = 256):
         chunk_layers = list(range(chunk_start, min(chunk_start + CHUNK_SIZE, N_LAYERS)))
         print(f"\n[sae] === chunk layers {chunk_layers[0]}-{chunk_layers[-1]} ===")
 
-        saes = {L: _load_sae(variant, L, device, dtype) for L in chunk_layers}
-        if d_sae is None:
-            d_sae = next(iter(saes.values())).cfg.d_sae
-
         t_acc_chunk, t_n = _encode_chunk_pass(
-            model, tokenizer, saes, topic,
+            model, tokenizer, variant, chunk_layers, topic,
             lambda r: cat_id[r["category"]], len(cats),
-            batch_size, max_length, device,
+            batch_size, max_length, device, dtype,
             desc=f"topic L{chunk_layers[0]}-{chunk_layers[-1]}",
         )
 
         b_acc_chunk, b_n = _encode_chunk_pass(
-            model, tokenizer, saes, bcorpus,
+            model, tokenizer, variant, chunk_layers, bcorpus,
             lambda r: r["_g"], 2,
-            batch_size, max_length, device,
+            batch_size, max_length, device, dtype,
             desc=f"comp L{chunk_layers[0]}-{chunk_layers[-1]}",
         )
+
+        if d_sae is None:
+            d_sae = next(iter(t_acc_chunk.values()))["sum"].shape[1]
 
         N_topic = float(t_n.sum().item())
         for L in chunk_layers:
             _write_layer_npz(L, variant, t_acc_chunk[L], t_n, b_acc_chunk[L], b_n, cats, N_topic)
 
-        del saes, t_acc_chunk, b_acc_chunk
+        del t_acc_chunk, b_acc_chunk
         torch.cuda.empty_cache()
 
     del model
