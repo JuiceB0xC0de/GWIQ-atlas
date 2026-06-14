@@ -7,9 +7,11 @@ Llama-3.1-8B-Base. Variants "32x" / "64x" are kept as output labels but map to
 Llama-Scope's 8x (32K features) and 32x (128K features) MLP releases. Writes
 sae_l<N>_<variant>.npz to /gwiq-output/llama-3-8b/sae/.
 
-Memory strategy: model loaded once. For each batch we capture MLP outputs for
-the target chunk on GPU, move them to CPU, then load SAEs one at a time to
-encode. This keeps peak GPU memory near model + 1 SAE + one batch activations.
+Memory strategy: model loaded once. SAEs are loaded in CHUNK_SIZE chunks once
+before processing. For each batch we capture MLP outputs for the chunk on GPU,
+move them to CPU, then for each layer move that layer's MLP output back to GPU
+and encode with the already-loaded SAE. Accumulators live on CPU. This avoids
+loading SAEs inside the batch loop.
 
 After this finishes:
     qwip-build-atlas --atlas /gwiq-output/atlas index
@@ -76,12 +78,11 @@ def _load_sae(variant: str, layer: int, device: str, dtype):
     return sae.to(dtype=dtype)
 
 
-def _encode_chunk_pass(model, tokenizer, variant: str, chunk_layers: list, corpus, group_fn, n_groups,
-                       batch_size, max_length, device, dtype, desc: str):
+def _encode_chunk_pass(model, tokenizer, saes: dict, chunk_layers: list, corpus, group_fn, n_groups,
+                       batch_size, max_length, device, desc: str):
     import torch
     from tqdm import tqdm
 
-    # Per-layer CPU-side accumulators.
     acc = {
         L: {
             "sum": None,
@@ -117,11 +118,9 @@ def _encode_chunk_pass(model, tokenizer, variant: str, chunk_layers: list, corpu
         for h in handles:
             h.remove()
 
-        # Move small metadata to CPU; move MLP outputs to CPU to free GPU before SAE encode.
         mask_cpu = mask.cpu()
         mlp_cpu = {L: captured[L].float().cpu() for L in chunk_layers}
 
-        # Accumulate token counts once.
         if group_n is None:
             group_n = torch.zeros(n_groups, dtype=torch.float64)
         for gid in set(groups):
@@ -131,9 +130,10 @@ def _encode_chunk_pass(model, tokenizer, variant: str, chunk_layers: list, corpu
             sub_mask = mask_cpu[idx]
             group_n[gid] += sub_mask.sum().item()
 
-        # Encode each layer with its own SAE, one at a time, to keep GPU memory low.
+        # Encode each layer with its already-loaded SAE. Only one layer's tokens are
+        # on GPU at a time.
         for L in chunk_layers:
-            sae = _load_sae(variant, L, device, dtype)
+            sae = saes[L]
             d_sae = sae.cfg.d_sae
 
             if acc[L]["sum"] is None:
@@ -162,7 +162,7 @@ def _encode_chunk_pass(model, tokenizer, variant: str, chunk_layers: list, corpu
                 acc[L]["sumsq"][gid].index_add_(0, flat_i, flat_v * flat_v)
                 acc[L]["active"].index_add_(0, flat_i, torch.ones_like(flat_v))
 
-            del sae, acts, vals, inds, tokens
+            del acts, vals, inds, tokens
             torch.cuda.empty_cache()
 
         del mlp_cpu, mask_cpu
@@ -247,28 +247,30 @@ def run_variant(variant: str, batch_size: int = 16, max_length: int = 256):
         chunk_layers = list(range(chunk_start, min(chunk_start + CHUNK_SIZE, N_LAYERS)))
         print(f"\n[sae] === chunk layers {chunk_layers[0]}-{chunk_layers[-1]} ===")
 
+        # Load all SAEs for this chunk ONCE.
+        saes = {L: _load_sae(variant, L, device, dtype) for L in chunk_layers}
+        if d_sae is None:
+            d_sae = next(iter(saes.values())).cfg.d_sae
+
         t_acc_chunk, t_n = _encode_chunk_pass(
-            model, tokenizer, variant, chunk_layers, topic,
+            model, tokenizer, saes, chunk_layers, topic,
             lambda r: cat_id[r["category"]], len(cats),
-            batch_size, max_length, device, dtype,
+            batch_size, max_length, device,
             desc=f"topic L{chunk_layers[0]}-{chunk_layers[-1]}",
         )
 
         b_acc_chunk, b_n = _encode_chunk_pass(
-            model, tokenizer, variant, chunk_layers, bcorpus,
+            model, tokenizer, saes, chunk_layers, bcorpus,
             lambda r: r["_g"], 2,
-            batch_size, max_length, device, dtype,
+            batch_size, max_length, device,
             desc=f"comp L{chunk_layers[0]}-{chunk_layers[-1]}",
         )
-
-        if d_sae is None:
-            d_sae = next(iter(t_acc_chunk.values()))["sum"].shape[1]
 
         N_topic = float(t_n.sum().item())
         for L in chunk_layers:
             _write_layer_npz(L, variant, t_acc_chunk[L], t_n, b_acc_chunk[L], b_n, cats, N_topic)
 
-        del t_acc_chunk, b_acc_chunk
+        del saes, t_acc_chunk, b_acc_chunk
         torch.cuda.empty_cache()
 
     del model

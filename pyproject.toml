@@ -26,6 +26,7 @@ analysis = [
   "sentence-transformers>=2.2",
   "datasets>=2.11",
   "tokenizers>=0.15",
+  "sae-lens>=6",
 ]
 
 [project.scripts]
