@@ -52,17 +52,18 @@ def _load_npz(path: str) -> np.lib.npyio.NpzFile:
     return np.load(path, allow_pickle=False)
 
 
-def merge(atlas: Path, variant: str, min_act: float) -> int:
+def merge(atlas: Path, variant: str, min_act: float, sae_dir: Path | None = None) -> int:
     db = atlas / "atlas.sqlite"
     if not db.exists():
         raise SystemExit(f"atlas sqlite not found: {db} (run atlas build first)")
+    search_dir = sae_dir or atlas
     files = sorted(
-        glob.glob(os.path.join(atlas, f"sae_l*_{variant}.npz")),
+        glob.glob(os.path.join(search_dir, f"sae_l*_{variant}.npz")),
         key=lambda p: int(re.search(r"sae_l(\d+)_", p).group(1)),
     )
     if not files:
         raise SystemExit(
-            f"no sae_l*_{variant}.npz files in atlas directory {atlas}"
+            f"no sae_l*_{variant}.npz files in {search_dir}"
         )
 
     con = sqlite3.connect(db)
@@ -151,8 +152,9 @@ def show_gold(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--variant", default="l0_50", choices=["l0_50", "l0_100"])
+    parser.add_argument("--variant", default="l0_50", help="SAE variant label, e.g. l0_50, 32x, 64x")
     parser.add_argument("--atlas", default=str(ATLAS))
+    parser.add_argument("--sae-dir", default=None, help="directory containing sae_l*_<variant>.npz files")
     parser.add_argument(
         "--min-activation",
         type=float,
@@ -165,11 +167,12 @@ def main():
     parser.add_argument("--n", type=int, default=25)
     args = parser.parse_args()
     atlas = Path(args.atlas).expanduser()
+    sae_dir = Path(args.sae_dir).expanduser() if args.sae_dir else None
 
     if args.gold:
         show_gold(atlas, args.variant, args.min_compliance_behaviour, args.max_topic, args.n)
     else:
-        merge(atlas, args.variant, args.min_activation)
+        merge(atlas, args.variant, args.min_activation, sae_dir)
         show_gold(atlas, args.variant, args.min_compliance_behaviour, args.max_topic, args.n)
 
 

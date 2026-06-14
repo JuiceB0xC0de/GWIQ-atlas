@@ -306,6 +306,22 @@ CREATE TABLE IF NOT EXISTS ov_circuits (
 );
 CREATE INDEX IF NOT EXISTS idx_ov_compliance ON ov_circuits(compliance_score DESC);
 CREATE INDEX IF NOT EXISTS idx_ov_spectral   ON ov_circuits(spectral_conc DESC);
+
+CREATE TABLE IF NOT EXISTS sae_features (
+    layer           INTEGER,
+    variant         TEXT,
+    feature_idx     INTEGER,
+    topic_fstat     REAL,
+    compliance_behaviour_fstat   REAL,
+    compliance_behaviour_delta   REAL,
+    mean_corp       REAL,
+    mean_auth       REAL,
+    activation_rate REAL,
+    corp_leaning    INTEGER,
+    PRIMARY KEY (layer, variant, feature_idx)
+);
+CREATE INDEX IF NOT EXISTS idx_sae_compliance_behaviour ON sae_features(variant, compliance_behaviour_fstat DESC);
+CREATE INDEX IF NOT EXISTS idx_sae_topic   ON sae_features(variant, topic_fstat);
 """
 
 
