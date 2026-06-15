@@ -17,7 +17,6 @@ Or copy this file to /gwiq-output first:
 """
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import sys
@@ -91,7 +90,7 @@ def main():
         print(f"  copied L{layer:02d}: {npz.name} -> {dst}")
 
     print("\n=== done ===")
-    print(f"Next: exit shell and run scripts/upload_llama_atlas_to_hf.py locally")
+    print("Next: exit shell and run scripts/upload_llama_atlas_to_hf.py locally")
 
 
 if __name__ == "__main__":
