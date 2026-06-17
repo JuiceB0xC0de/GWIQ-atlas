@@ -48,24 +48,38 @@ def _last_token_components(captured: dict[tuple[int, str], Any], layer: int, inf
     if mlp_hidden is None:
         return {}
 
-    gate_pre = captured.get((layer, "gate_pre"))
-    gate_post = act_fn(gate_pre) if gate_pre is not None else None
+    def _get_last(key):
+        t = captured.get((layer, key))
+        if t is None:
+            return None
+        # Optimization: Slice batch and sequence dimensions before any processing
+        return t[batch_idx, sl][-1]
+
+    gate_pre_last = _get_last("gate_pre")
+    # Apply activation function ONLY to the last token, avoiding O(batch_size * seq_len * d_mlp) cost
+    gate_post = act_fn(gate_pre_last) if gate_pre_last is not None else None
+
+    def _safe_per_head_last(tensor_last, head_dim: int | None):
+        if tensor_last is None or not head_dim or tensor_last.shape[-1] % head_dim != 0:
+            return None
+        return tensor_last
+
     tensors = {
-        "mlp": mlp_hidden,
+        "mlp": _get_last("mlp_hidden"),
         "gate": gate_post,
-        "up": captured.get((layer, "up")),
-        "attn": captured.get((layer, "attn_out")),
-        "heads": _safe_per_head(captured.get((layer, "attn_pre")), head_dim),
-        "q": _safe_per_head(captured.get((layer, "q")), head_dim),
-        "k": _safe_per_head(captured.get((layer, "k")), head_dim),
-        "v": _safe_per_head(captured.get((layer, "v")), head_dim),
+        "up": _get_last("up"),
+        "attn": _get_last("attn_out"),
+        "heads": _safe_per_head_last(_get_last("attn_pre"), head_dim),
+        "q": _safe_per_head_last(_get_last("q"), head_dim),
+        "k": _safe_per_head_last(_get_last("k"), head_dim),
+        "v": _safe_per_head_last(_get_last("v"), head_dim),
     }
 
     out = {}
     for name, tensor in tensors.items():
         if tensor is None:
             continue
-        out[name] = tensor[batch_idx, sl][-1].reshape(-1).cpu().float().numpy()
+        out[name] = tensor.reshape(-1).cpu().float().numpy()
     return out
 
 
