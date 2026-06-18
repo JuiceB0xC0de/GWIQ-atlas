@@ -37,35 +37,43 @@ def _safe_per_head(tensor, head_dim: int | None):
     return tensor.reshape(tensor.shape[0], tensor.shape[1], tensor.shape[-1] // head_dim, head_dim)
 
 
-def _last_token_components(captured: dict[tuple[int, str], Any], layer: int, info: dict, batch_idx: int, seq_len: int):
+def _batch_last_token_components(captured: dict[tuple[int, str], Any], layer: int, info: dict):
     import torch
 
     act_fn = info["mlp"]["act_fn"] or torch.nn.functional.silu
     head_dim = info["attn"]["head_dim"]
-    sl = slice(-seq_len, None)
 
     mlp_hidden = captured.get((layer, "mlp_hidden"))
     if mlp_hidden is None:
         return {}
 
-    gate_pre = captured.get((layer, "gate_pre"))
-    gate_post = act_fn(gate_pre) if gate_pre is not None else None
+    # With left-padding, the last token of the actual sequence is always at index -1.
+    # Slice the tensors before applying activation function or reshaping.
     tensors = {
-        "mlp": mlp_hidden,
-        "gate": gate_post,
+        "mlp": mlp_hidden[:, -1, :],
         "up": captured.get((layer, "up")),
         "attn": captured.get((layer, "attn_out")),
-        "heads": _safe_per_head(captured.get((layer, "attn_pre")), head_dim),
-        "q": _safe_per_head(captured.get((layer, "q")), head_dim),
-        "k": _safe_per_head(captured.get((layer, "k")), head_dim),
-        "v": _safe_per_head(captured.get((layer, "v")), head_dim),
     }
+    if tensors["up"] is not None:
+        tensors["up"] = tensors["up"][:, -1, :]
+    if tensors["attn"] is not None:
+        tensors["attn"] = tensors["attn"][:, -1, :]
+
+    gate_pre = captured.get((layer, "gate_pre"))
+    tensors["gate"] = act_fn(gate_pre[:, -1, :]) if gate_pre is not None else None
+
+    for k in ["attn_pre", "q", "k", "v"]:
+        t = captured.get((layer, k))
+        if t is not None:
+            name = k if k != "attn_pre" else "heads"
+            res = _safe_per_head(t[:, -1, :].unsqueeze(1), head_dim)
+            tensors[name] = res.squeeze(1) if res is not None else None
 
     out = {}
     for name, tensor in tensors.items():
         if tensor is None:
             continue
-        out[name] = tensor[batch_idx, sl][-1].reshape(-1).cpu().float().numpy()
+        out[name] = tensor.reshape(tensor.shape[0], -1).cpu().float().numpy()
     return out
 
 
@@ -170,11 +178,11 @@ def run_compliance_behaviour(cfg: ComplianceBehaviourRunConfig, hf_token: str | 
             handle.remove()
 
         for layer, info in per_layer_info.items():
-            for batch_idx, ((_, label), seq_len) in enumerate(zip(batch, seq_lens)):
-                comps = _last_token_components(captured, layer, info, batch_idx, int(seq_len))
-                for comp, vector in comps.items():
+            batch_comps = _batch_last_token_components(captured, layer, info)
+            for batch_idx, ((_, label), _) in enumerate(zip(batch, seq_lens)):
+                for comp, batch_vectors in batch_comps.items():
                     if comp in cfg.components:
-                        values[layer][comp][label].append(vector)
+                        values[layer][comp][label].append(batch_vectors[batch_idx])
         captured.clear()
 
     result: dict[str, dict] = {}
