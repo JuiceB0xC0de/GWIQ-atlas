@@ -1,3 +1,7 @@
 ## 2024-05-15 - [Vectorizing Array Reductions]
 **Learning:** In the `qwip-atlas` codebase, where layer activations can be thousands of dimensions (e.g. `d_mlp` around 14336), computing boolean masks and taking array reductions (`mean`, `std`) inside a Python `for` loop over dimensions causes massive slow-downs (from 0.3s up to 10s per call).
 **Action:** Always prioritize calculating aggregations and slice means over the entire tensor dimension across all rows prior to looping through individual rows, thereby doing operations once via NumPy's highly-optimized C backend.
+
+## 2024-05-18 - [Optimization of batched operations in qwip-atlas extractors]
+**Learning:** [In `compliance_behaviour.py`, the previous per-row approach mapped an activation function across the entire variable sequence length for every item, and performed slow row-by-row CPU-to-numpy conversions. Because the codebase uses `left` padding, the last actual sequence token is always located statically at `tensor[:, -1]`. We can utilize this to slice *before* any tensor operations, avoiding expensive operations on discarded tokens, and allowing true PyTorch vectorization prior to a single batch `.cpu().numpy()` transfer.]
+**Action:** [Always slice PyTorch tensors to the absolute minimum required dimensions (like last token indices) *before* applying computational transformations like activation functions or reshaping, especially in heavy batch extractions.]
