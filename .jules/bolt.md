@@ -1,3 +1,7 @@
 ## 2024-05-15 - [Vectorizing Array Reductions]
 **Learning:** In the `qwip-atlas` codebase, where layer activations can be thousands of dimensions (e.g. `d_mlp` around 14336), computing boolean masks and taking array reductions (`mean`, `std`) inside a Python `for` loop over dimensions causes massive slow-downs (from 0.3s up to 10s per call).
 **Action:** Always prioritize calculating aggregations and slice means over the entire tensor dimension across all rows prior to looping through individual rows, thereby doing operations once via NumPy's highly-optimized C backend.
+
+## 2024-06-20 - Vectorized Operations for Variable-Length Batches and Tensor Slicing
+**Learning:** In the `qwip-atlas` codebase, variable-length sequence masking in `local_census.py` and last-token tensor slicing in `compliance_behaviour.py` initially relied on Python `for` loops. This structure becomes a bottleneck since tensors and arrays are large. For left-padded arrays/tensors, the last valid token is always at index `-1`.
+**Action:** When extracting variable-length batch sequences with left-padding, always use pure vectorized operations (e.g., `np.arange(max_seq_len) >= (max_seq_len - np.array(seq_lens)[:, None])`) for boolean masks, and use `tensor[:, -1]` to select the last token *before* executing expensive downstream aggregations, reshaping, or activation functions across the entire batch to eliminate loop overhead and O(B * max_seq_len) redundancy.
