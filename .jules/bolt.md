@@ -1,3 +1,7 @@
 ## 2024-05-15 - [Vectorizing Array Reductions]
 **Learning:** In the `qwip-atlas` codebase, where layer activations can be thousands of dimensions (e.g. `d_mlp` around 14336), computing boolean masks and taking array reductions (`mean`, `std`) inside a Python `for` loop over dimensions causes massive slow-downs (from 0.3s up to 10s per call).
 **Action:** Always prioritize calculating aggregations and slice means over the entire tensor dimension across all rows prior to looping through individual rows, thereby doing operations once via NumPy's highly-optimized C backend.
+
+## 2024-05-15 - [Vectorizing PyTorch slicing before activation functions and NumPy broadcasting]
+**Learning:** In PyTorch extraction pipelines on transformers, applying activation functions on large padded batched sequences before extracting the final token performs massive redundant calculations for `O(batch_size * max_seq_len)` instead of `O(batch_size * 1)`. Due to left padding, `tensor[:, -1, :]` perfectly extracts the sequence. Additionally, constructing mask loops dynamically with `np.zeros()` and a Python `for` loop over `seq_lens` adds Python-level execution overhead which can be efficiently replaced with a C-optimized vectorized broadcast logic `np.arange(max_seq_len) >= (max_seq_len - np.array(seq_lens)[:, None])`.
+**Action:** Always slice sequence representations down to the target dimension *before* performing computationally expensive tensor transforms, and replace boolean-mask list loop iterations with vector-broadcasting NumPy routines for batch metadata processing.
