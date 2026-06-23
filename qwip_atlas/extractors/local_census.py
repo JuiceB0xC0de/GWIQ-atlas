@@ -124,9 +124,8 @@ def _slice_and_mean(tensor: Any, seq_lens: list[int]) -> tuple[Any, Any]:
     last = tensor[:, -1, ...]
 
     # Build a per-example length mask.
-    mask = np.zeros((B, max_seq_len), dtype=bool)
-    for i, length in enumerate(seq_lens):
-        mask[i, -length:] = True
+    # Replaces O(batch_size) python loop with a vectorized numpy operation.
+    mask = np.arange(max_seq_len) >= (max_seq_len - np.array(seq_lens)[:, None])
 
     # Expand mask to broadcast against arbitrary trailing dims.
     expand_axes = tuple(range(2, tensor.ndim))
