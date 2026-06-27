@@ -1,0 +1,77 @@
+--- qwip_atlas/extractors/compliance_behaviour.py
++++ qwip_atlas/extractors/compliance_behaviour.py
+@@ -34,36 +34,39 @@
+ def _safe_per_head(tensor, head_dim: int | None):
+     if tensor is None or not head_dim or tensor.shape[-1] % head_dim != 0:
+         return None
+-    return tensor.reshape(tensor.shape[0], tensor.shape[1], tensor.shape[-1] // head_dim, head_dim)
++    return tensor.reshape(*tensor.shape[:-1], tensor.shape[-1] // head_dim, head_dim)
+
+
+-def _last_token_components(captured: dict[tuple[int, str], Any], layer: int, info: dict, batch_idx: int, seq_len: int):
++def _batch_last_token_components(captured: dict[tuple[int, str], Any], layer: int, info: dict, components: set[str]):
+     import torch
+
+     act_fn = info["mlp"]["act_fn"] or torch.nn.functional.silu
+     head_dim = info["attn"]["head_dim"]
+-    sl = slice(-seq_len, None)
+
+     mlp_hidden = captured.get((layer, "mlp_hidden"))
+     if mlp_hidden is None:
+         return {}
+
+-    gate_pre = captured.get((layer, "gate_pre"))
+-    gate_post = act_fn(gate_pre) if gate_pre is not None else None
+-    tensors = {
+-        "mlp": mlp_hidden,
+-        "gate": gate_post,
+-        "up": captured.get((layer, "up")),
+-        "attn": captured.get((layer, "attn_out")),
+-        "heads": _safe_per_head(captured.get((layer, "attn_pre")), head_dim),
+-        "q": _safe_per_head(captured.get((layer, "q")), head_dim),
+-        "k": _safe_per_head(captured.get((layer, "k")), head_dim),
+-        "v": _safe_per_head(captured.get((layer, "v")), head_dim),
+-    }
++    def get_sliced(key):
++        t = captured.get((layer, key))
++        return t[:, -1] if t is not None else None
++
++    tensors = {}
++    if "mlp" in components:
++        tensors["mlp"] = get_sliced("mlp_hidden")
++    if "gate" in components:
++        gate_pre = get_sliced("gate_pre")
++        tensors["gate"] = act_fn(gate_pre) if gate_pre is not None else None
++    if "up" in components:
++        tensors["up"] = get_sliced("up")
++    if "attn" in components:
++        tensors["attn"] = get_sliced("attn_out")
++    for key in ["heads", "q", "k", "v"]:
++        if key in components or (key == "heads" and "attn_pre" in components):
++            tensors[key] = _safe_per_head(get_sliced(key if key != "heads" else "attn_pre"), head_dim)
+
+     out = {}
+     for name, tensor in tensors.items():
+         if tensor is None:
+             continue
+-        out[name] = tensor[batch_idx, sl][-1].reshape(-1).cpu().float().numpy()
++        out[name] = tensor.reshape(tensor.shape[0], -1).cpu().float().numpy()
+     return out
+
+
+@@ -171,9 +174,8 @@
+             handle.remove()
+
+         for layer, info in per_layer_info.items():
+-            for batch_idx, ((_, label), seq_len) in enumerate(zip(batch, seq_lens)):
+-                comps = _last_token_components(captured, layer, info, batch_idx, int(seq_len))
+-                for comp, vector in comps.items():
+-                    if comp in cfg.components:
+-                        values[layer][comp][label].append(vector)
++            batch_comps = _batch_last_token_components(captured, layer, info, cfg.components)
++            for batch_idx, ((_, label), _) in enumerate(zip(batch, seq_lens)):
++                for comp, vectors in batch_comps.items():
++                    values[layer][comp][label].append(vectors[batch_idx])
+         captured.clear()
+
+     result: dict[str, dict] = {}
