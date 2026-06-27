@@ -1,3 +1,6 @@
 ## 2024-05-15 - [Vectorizing Array Reductions]
 **Learning:** In the `qwip-atlas` codebase, where layer activations can be thousands of dimensions (e.g. `d_mlp` around 14336), computing boolean masks and taking array reductions (`mean`, `std`) inside a Python `for` loop over dimensions causes massive slow-downs (from 0.3s up to 10s per call).
 **Action:** Always prioritize calculating aggregations and slice means over the entire tensor dimension across all rows prior to looping through individual rows, thereby doing operations once via NumPy's highly-optimized C backend.
+## 2025-02-12 - [Vectorized Token Processing & Reduced GPU Transfers]
+**Learning:** In PyTorch code performing extraction, iterating over batch indices within a Python loop to extract sequences (especially doing single row `cpu().numpy()` conversions and slicing post-activation function) causes severe GPU stalling and CPU bottlenecks.
+**Action:** When extracting components (like the last token using `[:, -1]` with left-padding), always slice the tensor immediately, apply activation functions *only* to the smaller slice, and transfer the entire batch tensor at once from GPU to CPU, returning vectors to iteration loops already in NumPy format.
