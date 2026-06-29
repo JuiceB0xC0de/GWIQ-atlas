@@ -17,7 +17,6 @@ then pushes it to juiceb0xc0de/llama-3.1-8b-atlas.
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 import tempfile

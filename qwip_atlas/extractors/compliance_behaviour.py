@@ -31,41 +31,49 @@ def _load_prompts(corpus, label: str) -> list[dict[str, Any]]:
     return rows
 
 
-def _safe_per_head(tensor, head_dim: int | None):
-    if tensor is None or not head_dim or tensor.shape[-1] % head_dim != 0:
-        return None
-    return tensor.reshape(tensor.shape[0], tensor.shape[1], tensor.shape[-1] // head_dim, head_dim)
-
-
 def _last_token_components(captured: dict[tuple[int, str], Any], layer: int, info: dict, batch_idx: int, seq_len: int):
     import torch
 
     act_fn = info["mlp"]["act_fn"] or torch.nn.functional.silu
     head_dim = info["attn"]["head_dim"]
-    sl = slice(-seq_len, None)
 
-    mlp_hidden = captured.get((layer, "mlp_hidden"))
+    # ⚡ Bolt: [performance improvement]
+    # Slicing the last token before applying activation and reshaping prevents redundant O(batch_size * seq_len) calculations.
+    # We can just take the last token at index -1 due to left-padding.
+    def get_last(key: str):
+        t = captured.get((layer, key))
+        if t is None:
+            return None
+        return t[batch_idx, -1]
+
+    def _safe_per_head_1d(tensor, head_dim: int | None):
+        if tensor is None or not head_dim or tensor.shape[-1] % head_dim != 0:
+            return None
+        return tensor.reshape(tensor.shape[-1] // head_dim, head_dim)
+
+    mlp_hidden = get_last("mlp_hidden")
     if mlp_hidden is None:
         return {}
 
-    gate_pre = captured.get((layer, "gate_pre"))
+    gate_pre = get_last("gate_pre")
     gate_post = act_fn(gate_pre) if gate_pre is not None else None
+
     tensors = {
         "mlp": mlp_hidden,
         "gate": gate_post,
-        "up": captured.get((layer, "up")),
-        "attn": captured.get((layer, "attn_out")),
-        "heads": _safe_per_head(captured.get((layer, "attn_pre")), head_dim),
-        "q": _safe_per_head(captured.get((layer, "q")), head_dim),
-        "k": _safe_per_head(captured.get((layer, "k")), head_dim),
-        "v": _safe_per_head(captured.get((layer, "v")), head_dim),
+        "up": get_last("up"),
+        "attn": get_last("attn_out"),
+        "heads": _safe_per_head_1d(get_last("attn_pre"), head_dim),
+        "q": _safe_per_head_1d(get_last("q"), head_dim),
+        "k": _safe_per_head_1d(get_last("k"), head_dim),
+        "v": _safe_per_head_1d(get_last("v"), head_dim),
     }
 
     out = {}
     for name, tensor in tensors.items():
         if tensor is None:
             continue
-        out[name] = tensor[batch_idx, sl][-1].reshape(-1).cpu().float().numpy()
+        out[name] = tensor.reshape(-1).cpu().float().numpy()
     return out
 
 
