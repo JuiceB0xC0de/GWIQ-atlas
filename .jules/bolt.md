@@ -1,3 +1,6 @@
 ## 2024-05-15 - [Vectorizing Array Reductions]
 **Learning:** In the `qwip-atlas` codebase, where layer activations can be thousands of dimensions (e.g. `d_mlp` around 14336), computing boolean masks and taking array reductions (`mean`, `std`) inside a Python `for` loop over dimensions causes massive slow-downs (from 0.3s up to 10s per call).
 **Action:** Always prioritize calculating aggregations and slice means over the entire tensor dimension across all rows prior to looping through individual rows, thereby doing operations once via NumPy's highly-optimized C backend.
+## 2024-05-18 - [Optimize Variable Sequences and Slicing in Extraction Pipelines]
+**Learning:** Due to left-padding in the tokenizer, the last real token is always at index `-1` of the sequence dimension. When masking for sequence length, use vectorized Numpy broadcast `np.arange(max_seq_len) >= (max_seq_len - np.array(seq_lens)[:, None])` instead of for loops. In extraction pipelines, slicing down to `-1` before performing computationally expensive operations like `act_fn` prevents O(batch_size * seq_len) redundant calculations.
+**Action:** When extracting activations with left padding, always slice immediately to `[-1]` before computing activations or reshaping head dimensions, and always replace Python `for` loops with vectorized Numpy broadcasing for length masks.
