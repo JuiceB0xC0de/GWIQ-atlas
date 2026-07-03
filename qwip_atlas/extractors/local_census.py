@@ -123,10 +123,9 @@ def _slice_and_mean(tensor: Any, seq_lens: list[int]) -> tuple[Any, Any]:
     max_seq_len = tensor.shape[1]
     last = tensor[:, -1, ...]
 
-    # Build a per-example length mask.
-    mask = np.zeros((B, max_seq_len), dtype=bool)
-    for i, length in enumerate(seq_lens):
-        mask[i, -length:] = True
+    # Build a per-example length mask using vectorized broadcasting
+    seq_lens_arr = np.asarray(seq_lens)
+    mask = np.arange(max_seq_len) >= (max_seq_len - seq_lens_arr)[:, None]
 
     # Expand mask to broadcast against arbitrary trailing dims.
     expand_axes = tuple(range(2, tensor.ndim))
@@ -134,7 +133,7 @@ def _slice_and_mean(tensor: Any, seq_lens: list[int]) -> tuple[Any, Any]:
         mask = np.expand_dims(mask, axis=expand_axes)
     masked = tensor * mask
     summed = masked.sum(axis=1)
-    mean = summed / np.array(seq_lens).reshape((B,) + (1,) * (tensor.ndim - 2))
+    mean = summed / seq_lens_arr.reshape((B,) + (1,) * (tensor.ndim - 2))
     return last, mean
 
 
