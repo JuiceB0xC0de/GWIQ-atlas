@@ -34,38 +34,52 @@ def _load_prompts(corpus, label: str) -> list[dict[str, Any]]:
 def _safe_per_head(tensor, head_dim: int | None):
     if tensor is None or not head_dim or tensor.shape[-1] % head_dim != 0:
         return None
-    return tensor.reshape(tensor.shape[0], tensor.shape[1], tensor.shape[-1] // head_dim, head_dim)
+    return tensor.reshape(*tensor.shape[:-1], tensor.shape[-1] // head_dim, head_dim)
 
 
-def _last_token_components(captured: dict[tuple[int, str], Any], layer: int, info: dict, batch_idx: int, seq_len: int):
+def _extract_batch_components(captured: dict[tuple[int, str], Any], layer: int, info: dict, components: set[str]):
     import torch
 
     act_fn = info["mlp"]["act_fn"] or torch.nn.functional.silu
     head_dim = info["attn"]["head_dim"]
-    sl = slice(-seq_len, None)
 
     mlp_hidden = captured.get((layer, "mlp_hidden"))
     if mlp_hidden is None:
         return {}
 
-    gate_pre = captured.get((layer, "gate_pre"))
-    gate_post = act_fn(gate_pre) if gate_pre is not None else None
-    tensors = {
-        "mlp": mlp_hidden,
-        "gate": gate_post,
-        "up": captured.get((layer, "up")),
-        "attn": captured.get((layer, "attn_out")),
-        "heads": _safe_per_head(captured.get((layer, "attn_pre")), head_dim),
-        "q": _safe_per_head(captured.get((layer, "q")), head_dim),
-        "k": _safe_per_head(captured.get((layer, "k")), head_dim),
-        "v": _safe_per_head(captured.get((layer, "v")), head_dim),
-    }
+    def get_last_token(key):
+        t = captured.get((layer, key))
+        return t[:, -1] if t is not None else None
+
+    tensors = {"mlp": get_last_token("mlp_hidden")}
+
+    if "gate" in components:
+        gate_pre = get_last_token("gate_pre")
+        tensors["gate"] = act_fn(gate_pre) if gate_pre is not None else None
+
+    if "up" in components:
+        tensors["up"] = get_last_token("up")
+
+    if "attn" in components:
+        tensors["attn"] = get_last_token("attn_out")
+
+    if "heads" in components:
+        tensors["heads"] = _safe_per_head(get_last_token("attn_pre"), head_dim)
+
+    if "q" in components:
+        tensors["q"] = _safe_per_head(get_last_token("q"), head_dim)
+
+    if "k" in components:
+        tensors["k"] = _safe_per_head(get_last_token("k"), head_dim)
+
+    if "v" in components:
+        tensors["v"] = _safe_per_head(get_last_token("v"), head_dim)
 
     out = {}
     for name, tensor in tensors.items():
         if tensor is None:
             continue
-        out[name] = tensor[batch_idx, sl][-1].reshape(-1).cpu().float().numpy()
+        out[name] = tensor.reshape(tensor.shape[0], -1).cpu().float().numpy()
     return out
 
 
@@ -158,7 +172,6 @@ def run_compliance_behaviour(cfg: ComplianceBehaviourRunConfig, hf_token: str | 
             truncation=True,
             max_length=cfg.model.max_length,
         )
-        seq_lens = enc["attention_mask"].sum(dim=1).tolist()
         device = getattr(model, "device", None) or next(model.parameters()).device
         enc = {k: v.to(device) for k, v in enc.items()}
 
@@ -170,11 +183,11 @@ def run_compliance_behaviour(cfg: ComplianceBehaviourRunConfig, hf_token: str | 
             handle.remove()
 
         for layer, info in per_layer_info.items():
-            for batch_idx, ((_, label), seq_len) in enumerate(zip(batch, seq_lens)):
-                comps = _last_token_components(captured, layer, info, batch_idx, int(seq_len))
-                for comp, vector in comps.items():
-                    if comp in cfg.components:
-                        values[layer][comp][label].append(vector)
+            batch_comps = _extract_batch_components(captured, layer, info, cfg.components)
+            for comp, vectors in batch_comps.items():
+                if comp in cfg.components:
+                    for batch_idx, (_, label) in enumerate(batch):
+                        values[layer][comp][label].append(vectors[batch_idx])
         captured.clear()
 
     result: dict[str, dict] = {}
