@@ -92,7 +92,6 @@ def main():
         with tqdm(total=len(tmp_dirs), unit="layer", desc="finalize") as pbar:
             for fut in concurrent.futures.as_completed(futures):
                 out_path, ok, msg, elapsed = fut.result()
-                status = "OK" if ok else "FAIL"
                 pbar.set_postfix({out_path.name: f"{elapsed:.1f}s"})
                 pbar.update(1)
                 if not ok:
